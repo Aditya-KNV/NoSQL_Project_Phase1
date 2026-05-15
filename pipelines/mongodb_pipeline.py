@@ -1,173 +1,162 @@
 # ─── pipelines/mongodb_pipeline.py ───────────────────────────────────────────
 """
-MongoDB ETL Pipeline.
+MongoDB Pipeline — Phase 2
 
-Flow per batch:
-  1. Insert parsed records into MongoDB collection.
-  2. Run aggregation pipelines for Q1, Q2, Q3 on the full collection
-     (results always reflect the cumulative dataset up to this batch).
-  3. Save aggregated results to PostgreSQL via db_loader.
+Queries (same as Phase 1):
+  Q1 — Daily Traffic Summary
+  Q2 — Top 20 Requested Resources
+  Q3 — Hourly Error Analysis
+
+Phase 2 changes from Phase 1:
+  - Timestamp-based batching via batch_loader (one batch per calendar day)
+  - Temp collection per batch: drop → insert → query → drop
+  - save_batch_metadata() called per batch
+  - log_date / log_hour taken directly from parser output (already present)
 """
 
 import time
+import uuid
 from datetime import datetime
-from pymongo import MongoClient, DESCENDING
 
-from parser.log_parser import parse_files
-from loader.db_loader  import (init_schema, new_run_id, save_run_metadata,
-                                save_q1, save_q2, save_q3)
+from pymongo import MongoClient
+from loader.batch_loader import load_batches
+from loader.db_loader import (
+    get_connection, new_run_id,
+    save_run_metadata, save_batch_metadata,
+    save_q1, save_q2, save_q3,
+)
 
-
-PIPELINE_NAME = "MongoDB"
-
-
-def _q1_aggregation():
-    return [
-        {"$group": {
-            "_id": {"log_date": "$log_date", "status_code": "$status_code"},
-            "request_count": {"$sum": 1},
-            "total_bytes":   {"$sum": "$bytes_transferred"},
-        }},
-        {"$project": {
-            "_id": 0,
-            "log_date":      "$_id.log_date",
-            "status_code":   "$_id.status_code",
-            "request_count": 1,
-            "total_bytes":   1,
-        }},
-        {"$sort": {"log_date": 1, "status_code": 1}},
-    ]
+Q2_TOP_N = 20
 
 
-def _q2_aggregation():
-    return [
-        {"$group": {
-            "_id": "$resource_path",
-            "request_count":      {"$sum": 1},
-            "total_bytes":        {"$sum": "$bytes_transferred"},
-            "distinct_hosts":     {"$addToSet": "$host"},
-        }},
-        {"$project": {
-            "_id": 0,
-            "resource_path":      "$_id",
-            "request_count":      1,
-            "total_bytes":        1,
-            "distinct_host_count": {"$size": "$distinct_hosts"},
-        }},
-        {"$sort":  {"request_count": -1}},
-        {"$limit": 20},
-    ]
-
-
-def _q3_aggregation():
-    return [
-        {"$group": {
-            "_id": {"log_date": "$log_date", "log_hour": "$log_hour"},
-            "total_request_count": {"$sum": 1},
-            "error_request_count": {"$sum": {
-                "$cond": [
-                    {"$and": [
-                        {"$gte": ["$status_code", 400]},
-                        {"$lte": ["$status_code", 599]},
-                    ]}, 1, 0
-                ]
-            }},
-            "error_hosts": {"$addToSet": {
-                "$cond": [
-                    {"$and": [
-                        {"$gte": ["$status_code", 400]},
-                        {"$lte": ["$status_code", 599]},
-                    ]}, "$host", "$$REMOVE"
-                ]
-            }},
-        }},
-        {"$project": {
-            "_id": 0,
-            "log_date":            "$_id.log_date",
-            "log_hour":            "$_id.log_hour",
-            "error_request_count": 1,
-            "total_request_count": 1,
-            "error_rate": {
-                "$cond": [
-                    {"$gt": ["$total_request_count", 0]},
-                    {"$divide": ["$error_request_count", "$total_request_count"]},
-                    0
-                ]
-            },
-            "distinct_error_hosts": {"$size": "$error_hosts"},
-        }},
-        {"$sort": {"log_date": 1, "log_hour": 1}},
-    ]
-
-
-def run(config: dict):
-    pg_config  = config["PG_CONFIG"]
-    mongo_uri  = config["MONGO_URI"]
-    mongo_db   = config["MONGO_DB"]
-    mongo_col  = config["MONGO_COL"]
-    batch_size = config["BATCH_SIZE"]
-    log_files  = config["LOG_FILES"]
-
-    # ── Setup ─────────────────────────────────────────────────────────────────
-    init_schema(pg_config)
+def run(pg_config: dict, mongo_uri: str, mongo_db: str, log_files: list):
     run_id     = new_run_id()
+    pipeline   = "MongoDB"
     started_at = datetime.utcnow()
-    start_time = time.time()
 
     client = MongoClient(mongo_uri)
     db     = client[mongo_db]
 
-    # Drop old data so each run is clean
-    db[mongo_col].drop()
-    collection = db[mongo_col]
+    batches_done  = 0
+    total_records = 0
+    total_malform = 0
+    batch_size_cfg = 0   # timestamp batching — no fixed size
 
-    total_records   = 0
-    total_batches   = 0
-    total_malformed = 0
+    for batch in load_batches(log_files):
+        t0  = time.perf_counter()
+        col = db["_batch_tmp"]
+        col.drop()
 
-    print(f"\n[MongoDB] Run ID: {run_id}")
-    print(f"[MongoDB] Processing files: {log_files}\n")
+        if batch["records"]:
+            col.insert_many(batch["records"], ordered=False)
 
-    for batch_id, batch, malformed in parse_files(log_files, batch_size):
-        total_batches   += 1
-        total_records   += len(batch)
-        total_malformed += malformed
+        q1_rows = _q1(col)
+        q2_rows = _q2(col)
+        q3_rows = _q3(col)
+        col.drop()
 
-        print(f"  Batch {batch_id:>4} | records={len(batch):>7} | malformed={malformed}")
+        elapsed = time.perf_counter() - t0
+        batches_done  += 1
+        total_records += batch["batch_size"]
+        total_malform += batch["malformed_count"]
+        avg_sz = total_records / batches_done
 
-        # ── Insert into MongoDB ───────────────────────────────────────────────
-        if batch:
-            collection.insert_many(batch, ordered=False)
+        save_batch_metadata(
+            pg_config, run_id, pipeline,
+            batch["batch_id"], batch["date"], batch["source_file"],
+            batch["batch_size"], round(avg_sz, 2),
+            batch["malformed_count"], round(elapsed, 4),
+            batch["start_ts"], batch["end_ts"],
+        )
+        save_q1(pg_config, run_id, pipeline, batch["batch_id"], q1_rows)
+        save_q2(pg_config, run_id, pipeline, batch["batch_id"], q2_rows)
+        save_q3(pg_config, run_id, pipeline, batch["batch_id"], q3_rows)
 
-        # ── Run aggregations on cumulative data ───────────────────────────────
-        q1_results = list(collection.aggregate(_q1_aggregation(), allowDiskUse=True))
-        q2_results = list(collection.aggregate(_q2_aggregation(), allowDiskUse=True))
-        q3_results = list(collection.aggregate(_q3_aggregation(), allowDiskUse=True))
-
-        # ── Save to PostgreSQL ────────────────────────────────────────────────
-        save_q1(pg_config, run_id, PIPELINE_NAME, batch_id,
-                [(r["log_date"], r["status_code"], r["request_count"], r["total_bytes"])
-                 for r in q1_results])
-
-        save_q2(pg_config, run_id, PIPELINE_NAME, batch_id,
-                [(r["resource_path"], r["request_count"], r["total_bytes"], r["distinct_host_count"])
-                 for r in q2_results])
-
-        save_q3(pg_config, run_id, PIPELINE_NAME, batch_id,
-                [(r["log_date"], r["log_hour"], r["error_request_count"],
-                  r["total_request_count"], r["error_rate"], r["distinct_error_hosts"])
-                 for r in q3_results])
+        print(f"  [MongoDB] {batch['batch_id']} ({batch['date']}) — "
+              f"{batch['batch_size']:,} records, "
+              f"{batch['malformed_count']:,} malformed, {elapsed:.2f}s")
 
     finished_at = datetime.utcnow()
-
-    save_run_metadata(pg_config, run_id, PIPELINE_NAME,
-                      started_at, finished_at,
-                      total_records, total_batches,
-                      batch_size, total_malformed)
-
-    runtime = time.time() - start_time
-    print(f"\n[MongoDB] Done in {runtime:.2f}s | "
-          f"batches={total_batches} | records={total_records} | malformed={total_malformed}")
-
+    save_run_metadata(
+        pg_config, run_id, pipeline, started_at, finished_at,
+        total_records, batches_done, batch_size_cfg, total_malform,
+    )
     client.close()
+    print(f"\n  [MongoDB] Done. run_id={run_id}")
     return run_id
+
+
+# ── Q1: Daily Traffic Summary ─────────────────────────────────────────────────
+def _q1(col):
+    pipeline = [
+        {"$group": {
+            "_id":           {"log_date": "$log_date", "status": "$status_code"},
+            "request_count": {"$sum": 1},
+            "total_bytes":   {"$sum": {"$ifNull": ["$bytes_transferred", 0]}},
+        }},
+        {"$sort": {"_id.log_date": 1, "_id.status": 1}},
+    ]
+    return [
+        (doc["_id"]["log_date"], doc["_id"]["status"],
+         doc["request_count"],  doc["total_bytes"])
+        for doc in col.aggregate(pipeline)
+    ]
+
+
+# ── Q2: Top 20 Requested Resources ───────────────────────────────────────────
+def _q2(col):
+    pipeline = [
+        {"$group": {
+            "_id":           "$resource_path",
+            "request_count": {"$sum": 1},
+            "total_bytes":   {"$sum": {"$ifNull": ["$bytes_transferred", 0]}},
+            "hosts":         {"$addToSet": "$host"},
+        }},
+        {"$project": {
+            "request_count":       1,
+            "total_bytes":         1,
+            "distinct_host_count": {"$size": "$hosts"},
+        }},
+        {"$sort":  {"request_count": -1}},
+        {"$limit": Q2_TOP_N},
+    ]
+    return [
+        (doc["_id"], doc["request_count"],
+         doc["total_bytes"], doc["distinct_host_count"])
+        for doc in col.aggregate(pipeline)
+    ]
+
+
+# ── Q3: Hourly Error Analysis ─────────────────────────────────────────────────
+def _q3(col):
+    # Total requests per (date, hour)
+    totals = {
+        (d["_id"]["log_date"], d["_id"]["log_hour"]): d["total"]
+        for d in col.aggregate([
+            {"$group": {
+                "_id":   {"log_date": "$log_date", "log_hour": "$log_hour"},
+                "total": {"$sum": 1},
+            }}
+        ])
+    }
+    # Error requests per (date, hour)
+    rows = []
+    for doc in col.aggregate([
+        {"$match": {"status_code": {"$gte": 400, "$lte": 599}}},
+        {"$group": {
+            "_id":         {"log_date": "$log_date", "log_hour": "$log_hour"},
+            "error_count": {"$sum": 1},
+            "error_hosts": {"$addToSet": "$host"},
+        }},
+        {"$sort": {"_id.log_date": 1, "_id.log_hour": 1}},
+    ]):
+        key       = (doc["_id"]["log_date"], doc["_id"]["log_hour"])
+        total     = totals.get(key, doc["error_count"])
+        err_count = doc["error_count"]
+        rows.append((
+            doc["_id"]["log_date"], doc["_id"]["log_hour"],
+            err_count, total,
+            round(err_count / total, 4) if total else 0.0,
+            len(doc["error_hosts"]),
+        ))
+    return rows

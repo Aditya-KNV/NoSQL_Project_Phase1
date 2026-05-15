@@ -1,370 +1,239 @@
 # ─── pipelines/pig_pipeline.py ───────────────────────────────────────────────
 """
-Apache Pig ETL Pipeline (MapReduce mode on Hadoop/HDFS).
+Apache Pig Pipeline — Phase 2  (local mode, no Hadoop)
 
-Flow per batch:
-  1. Write parsed records to a temp CSV file locally.
-  2. Upload CSV batch to HDFS.
-  3. Generate Pig Latin scripts for Q1, Q2, Q3.
-  4. Execute each script via: pig -x mapreduce script.pig
-  5. Wait for HDFS output to appear.
-  6. Read output back from HDFS into PostgreSQL.
-  7. Clean up HDFS batch files after each batch.
+Phase 2 changes from Phase 1 pig_local_pipeline.py:
+  - Timestamp-based batching (one batch per calendar day)
+  - TSV now includes log_date, log_hour, bytes columns
+  - save_batch_metadata() called per batch
+  - pig_pipeline.py replaces both pig_pipeline.py (Hadoop) and
+    pig_local_pipeline.py — local mode only
+
+Queries:
+  Q1 — Daily Traffic Summary:   GROUP BY (log_date, status)
+  Q2 — Top 20 Requested Resources: GROUP BY resource_path  LIMIT 20
+  Q3 — Hourly Error Analysis:   filter status 400-599, GROUP BY (log_date, log_hour)
 """
 
 import os
-import csv
-import time
-import subprocess
 import shutil
+import subprocess
+import time
+import uuid
 from datetime import datetime
 
-from parser.log_parser import parse_files
-from loader.db_loader  import (init_schema, new_run_id, save_run_metadata,
-                                save_q1, save_q2, save_q3)
+from loader.batch_loader import load_batches
+from loader.db_loader import (
+    new_run_id, save_run_metadata, save_batch_metadata,
+    save_q1, save_q2, save_q3,
+)
 
-PIPELINE_NAME  = "Pig"
-TMP_DIR        = "/tmp/pig_etl"
-HDFS_INPUT     = "/nasa/pig_input"
-HDFS_OUTPUT    = "/nasa/pig_output"
-PIG_BIN        = "/usr/local/pig/bin/pig"
+Q2_TOP_N = 20
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HDFS helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def run(pg_config: dict, log_files: list, pig_home: str = "", pig_tmp: str = "pig_tmp"):
+    run_id     = new_run_id()
+    pipeline   = "Pig"
+    started_at = datetime.utcnow()
 
-def _hdfs(args: list) -> bool:
-    result = subprocess.run(["hdfs", "dfs"] + args,
-                            capture_output=True, text=True)
-    return result.returncode == 0
+    os.makedirs(pig_tmp, exist_ok=True)
+    pig_bin = os.path.join(pig_home, "bin", "pig") if pig_home else "pig"
 
+    batches_done  = 0
+    total_records = 0
+    total_malform = 0
 
-def _hdfs_put(local_path: str, hdfs_path: str) -> bool:
-    result = subprocess.run(
-        ["hdfs", "dfs", "-put", "-f", local_path, hdfs_path],
-        capture_output=True, text=True
+    for batch in load_batches(log_files):
+        t0 = time.perf_counter()
+
+        # TSV: host, status_code, resource_path, log_date, log_hour, bytes_transferred
+        tsv_path = os.path.join(pig_tmp, "batch_input.tsv")
+        with open(tsv_path, "w", encoding="utf-8") as f:
+            for r in batch["records"]:
+                host   = (r.get("host")          or "").replace("\t", " ")
+                status = str(r.get("status_code") or "")
+                path   = (r.get("resource_path")  or "").replace("\t", " ")
+                date   = r.get("log_date",  "")
+                hour   = str(r.get("log_hour", ""))
+                byt    = str(r.get("bytes_transferred") or 0)
+                f.write(f"{host}\t{status}\t{path}\t{date}\t{hour}\t{byt}\n")
+
+        q1_rows = _run_q1(pig_bin, pig_tmp, tsv_path)
+        q2_rows = _run_q2(pig_bin, pig_tmp, tsv_path)
+        q3_rows = _run_q3(pig_bin, pig_tmp, tsv_path)
+
+        elapsed = time.perf_counter() - t0
+        batches_done  += 1
+        total_records += batch["batch_size"]
+        total_malform += batch["malformed_count"]
+        avg_sz = total_records / batches_done
+
+        save_batch_metadata(
+            pg_config, run_id, pipeline,
+            batch["batch_id"], batch["date"], batch["source_file"],
+            batch["batch_size"], round(avg_sz, 2),
+            batch["malformed_count"], round(elapsed, 4),
+            batch["start_ts"], batch["end_ts"],
+        )
+        save_q1(pg_config, run_id, pipeline, batch["batch_id"], q1_rows)
+        save_q2(pg_config, run_id, pipeline, batch["batch_id"], q2_rows)
+        save_q3(pg_config, run_id, pipeline, batch["batch_id"], q3_rows)
+
+        print(f"  [Pig] {batch['batch_id']} ({batch['date']}) — "
+              f"{batch['batch_size']:,} records, "
+              f"{batch['malformed_count']:,} malformed, {elapsed:.2f}s")
+
+    finished_at = datetime.utcnow()
+    save_run_metadata(
+        pg_config, run_id, pipeline, started_at, finished_at,
+        total_records, batches_done, 0, total_malform,
     )
-    if result.returncode != 0:
-        print(f"[Pig HDFS PUT ERROR] {result.stderr[-500:]}")
-    return result.returncode == 0
+    print(f"\n  [Pig] Done. run_id={run_id}")
+    return run_id
 
 
-def _hdfs_getmerge(hdfs_path: str, local_path: str) -> bool:
-    # Remove local file if exists
-    if os.path.exists(local_path):
-        os.remove(local_path)
-    result = subprocess.run(
-        ["hdfs", "dfs", "-getmerge", hdfs_path, local_path],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"[Pig HDFS GETMERGE ERROR] {result.stderr[-500:]}")
-    return result.returncode == 0
+# ── Pig helpers ───────────────────────────────────────────────────────────────
 
-
-def _hdfs_rm(hdfs_path: str):
-    subprocess.run(
-        ["hdfs", "dfs", "-rm", "-r", "-f", hdfs_path],
-        capture_output=True, text=True
-    )
-
-
-def _hdfs_mkdir(hdfs_path: str):
-    subprocess.run(
-        ["hdfs", "dfs", "-mkdir", "-p", hdfs_path],
-        capture_output=True, text=True
-    )
-
-
-def _hdfs_exists(hdfs_path: str) -> bool:
-    result = subprocess.run(
-        ["hdfs", "dfs", "-test", "-e", hdfs_path],
-        capture_output=True, text=True
-    )
-    return result.returncode == 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Write batch to CSV
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _write_csv(batch: list, path: str):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter='\t')
-        for r in batch:
-            writer.writerow([
-                r["host"],
-                r["log_date"],
-                r["log_hour"],
-                r["http_method"],
-                r["resource_path"],
-                r["protocol_version"],
-                r["status_code"],
-                r["bytes_transferred"],
-            ])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pig script generators
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _pig_q1(hdfs_input: str, hdfs_output: str) -> str:
-    return f"""
-records = LOAD '{hdfs_input}' USING PigStorage('\t') AS (
-    host:chararray,
-    log_date:chararray,
-    log_hour:int,
-    http_method:chararray,
-    resource_path:chararray,
-    protocol_version:chararray,
-    status_code:int,
-    bytes_transferred:long
-);
-
-filtered = FILTER records BY log_date IS NOT NULL AND status_code IS NOT NULL;
-
-grouped = GROUP filtered BY (log_date, status_code);
-
-q1 = FOREACH grouped GENERATE
-    FLATTEN(group)                  AS (log_date, status_code),
-    COUNT(filtered)                 AS request_count,
-    SUM(filtered.bytes_transferred) AS total_bytes;
-
-q1_sorted = ORDER q1 BY log_date ASC, status_code ASC;
-
-STORE q1_sorted INTO '{hdfs_output}' USING PigStorage('\t');
-"""
-
-
-def _pig_q2(hdfs_input: str, hdfs_output: str) -> str:
-    return f"""
-records = LOAD '{hdfs_input}' USING PigStorage('\t') AS (
-    host:chararray,
-    log_date:chararray,
-    log_hour:int,
-    http_method:chararray,
-    resource_path:chararray,
-    protocol_version:chararray,
-    status_code:int,
-    bytes_transferred:long
-);
-
-filtered = FILTER records BY resource_path IS NOT NULL;
-
-grouped = GROUP filtered BY resource_path;
-
-q2 = FOREACH grouped GENERATE
-    group                               AS resource_path,
-    COUNT(filtered)                     AS request_count,
-    SUM(filtered.bytes_transferred)     AS total_bytes,
-    COUNT(filtered)                     AS distinct_host_count;
-
-STORE q2 INTO '{hdfs_output}' USING PigStorage('\t');
-"""
-
-
-def _pig_q3(hdfs_input: str, hdfs_output: str) -> str:
-    return f"""
-records = LOAD '{hdfs_input}' USING PigStorage('\t') AS (
-    host:chararray,
-    log_date:chararray,
-    log_hour:int,
-    http_method:chararray,
-    resource_path:chararray,
-    protocol_version:chararray,
-    status_code:int,
-    bytes_transferred:long
-);
-
-filtered = FILTER records BY log_date IS NOT NULL AND log_hour IS NOT NULL;
-errors   = FILTER filtered BY status_code >= 400 AND status_code <= 599;
-
-grouped_all    = GROUP filtered BY (log_date, log_hour);
-grouped_errors = GROUP errors   BY (log_date, log_hour);
-
-total_counts = FOREACH grouped_all GENERATE
-    FLATTEN(group)  AS (log_date, log_hour),
-    COUNT(filtered) AS total_request_count;
-
-error_counts = FOREACH grouped_errors GENERATE
-    FLATTEN(group)       AS (log_date, log_hour),
-    COUNT(errors)        AS error_request_count,
-    COUNT(errors)        AS distinct_error_hosts;
-
-joined = JOIN total_counts BY (log_date, log_hour)
-         LEFT OUTER,
-         error_counts BY (log_date, log_hour);
-
-q3 = FOREACH joined GENERATE
-    total_counts::log_date         AS log_date,
-    total_counts::log_hour         AS log_hour,
-    (error_counts::error_request_count IS NULL ? 0L :
-        error_counts::error_request_count)             AS error_request_count,
-    total_counts::total_request_count                  AS total_request_count,
-    (error_counts::error_request_count IS NULL ? 0.0 :
-        (double)error_counts::error_request_count /
-        (double)total_counts::total_request_count)     AS error_rate,
-    (error_counts::distinct_error_hosts IS NULL ? 0L :
-        error_counts::distinct_error_hosts)            AS distinct_error_hosts;
-
-q3_sorted = ORDER q3 BY log_date ASC, log_hour ASC;
-
-STORE q3_sorted INTO '{hdfs_output}' USING PigStorage('\t');
-"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Run a Pig script and wait for HDFS output to appear
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _run_pig(script_content: str, script_path: str, hdfs_out: str) -> bool:
+def _exec_pig(pig_bin, pig_tmp, script: str):
+    script_path = os.path.join(pig_tmp, "query.pig")
     with open(script_path, "w") as f:
-        f.write(script_content)
-
+        f.write(script)
     result = subprocess.run(
-        [PIG_BIN, "-x", "mapreduce", "-f", script_path],
-        capture_output=True, text=True
+        [pig_bin, "-x", "local", script_path],
+        capture_output=True, text=True,
     )
-
     if result.returncode != 0:
-        print(f"[Pig ERROR]\n{result.stderr[-2000:]}")
-        return False
-
-    # Wait up to 60s for HDFS output directory to appear
-    for _ in range(30):
-        if _hdfs_exists(hdfs_out):
-            return True
-        time.sleep(2)
-
-    print(f"[Pig] Timeout waiting for HDFS output: {hdfs_out}")
-    return False
+        raise RuntimeError(
+            f"Pig failed (rc={result.returncode}):\n{result.stderr[-2000:]}"
+        )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Read merged output file
-# ─────────────────────────────────────────────────────────────────────────────
+def _read_output(out_dir: str) -> list:
+    lines = []
+    for fname in sorted(os.listdir(out_dir)):
+        if fname.startswith("part-"):
+            with open(os.path.join(out_dir, fname)) as f:
+                lines.extend(f.read().splitlines())
+    return lines
 
-def _read_output(merged_file: str) -> list:
+
+# ── Q1 ────────────────────────────────────────────────────────────────────────
+
+def _run_q1(pig_bin, pig_tmp, tsv) -> list:
+    out_dir = os.path.join(pig_tmp, "q1_out")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    _exec_pig(pig_bin, pig_tmp, f"""
+logs = LOAD '{tsv}' USING PigStorage('\\t')
+       AS (host:chararray, status_code:int, resource_path:chararray,
+           log_date:chararray, log_hour:int, bytes_transferred:long);
+grp  = GROUP logs BY (log_date, status_code);
+res  = FOREACH grp GENERATE
+           FLATTEN(group)          AS (log_date, status_code),
+           COUNT(logs)             AS request_count,
+           SUM(logs.bytes_transferred) AS total_bytes;
+srt  = ORDER res BY log_date ASC, status_code ASC;
+STORE srt INTO '{out_dir}' USING PigStorage('\\t');
+""")
     rows = []
-    if not os.path.exists(merged_file):
-        return rows
-    with open(merged_file, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(line.split("\t"))
+    for line in _read_output(out_dir):
+        p = line.split("\t")
+        if len(p) == 4:
+            try:
+                rows.append((p[0], int(p[1]), int(p[2]), int(p[3])))
+            except ValueError:
+                pass
     return rows
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Q2 ────────────────────────────────────────────────────────────────────────
 
-def run(config: dict):
-    pg_config  = config["PG_CONFIG"]
-    batch_size = config["BATCH_SIZE"]
-    log_files  = config["LOG_FILES"]
+def _run_q2(pig_bin, pig_tmp, tsv) -> list:
+    out_dir = os.path.join(pig_tmp, "q2_out")
+    shutil.rmtree(out_dir, ignore_errors=True)
+    _exec_pig(pig_bin, pig_tmp, f"""
+logs = LOAD '{tsv}' USING PigStorage('\\t')
+       AS (host:chararray, status_code:int, resource_path:chararray,
+           log_date:chararray, log_hour:int, bytes_transferred:long);
+grp  = GROUP logs BY resource_path;
+res  = FOREACH grp {{
+           unique_hosts = DISTINCT logs.host;
+           GENERATE
+               group                       AS resource_path,
+               COUNT(logs)                 AS request_count,
+               SUM(logs.bytes_transferred) AS total_bytes,
+               COUNT(unique_hosts)         AS distinct_host_count;
+       }}
+srt  = ORDER res BY request_count DESC;
+top  = LIMIT srt {Q2_TOP_N};
+STORE top INTO '{out_dir}' USING PigStorage('\\t');
+""")
+    rows = []
+    for line in _read_output(out_dir):
+        p = line.split("\t")
+        if len(p) == 4:
+            try:
+                rows.append((p[0], int(p[1]), int(p[2]), int(p[3])))
+            except ValueError:
+                pass
+    return rows
 
-    init_schema(pg_config)
-    run_id     = new_run_id()
-    started_at = datetime.utcnow()
-    start_time = time.time()
 
-    total_records   = 0
-    total_batches   = 0
-    total_malformed = 0
+# ── Q3 ────────────────────────────────────────────────────────────────────────
 
-    # Clean and create local tmp dir
-    if os.path.exists(TMP_DIR):
-        shutil.rmtree(TMP_DIR)
-    os.makedirs(TMP_DIR)
+def _run_q3(pig_bin, pig_tmp, tsv) -> list:
+    # Pass 1: total requests per (date, hour)
+    total_dir = os.path.join(pig_tmp, "q3_total_out")
+    shutil.rmtree(total_dir, ignore_errors=True)
+    _exec_pig(pig_bin, pig_tmp, f"""
+logs = LOAD '{tsv}' USING PigStorage('\\t')
+       AS (host:chararray, status_code:int, resource_path:chararray,
+           log_date:chararray, log_hour:int, bytes_transferred:long);
+grp  = GROUP logs BY (log_date, log_hour);
+tot  = FOREACH grp GENERATE
+           FLATTEN(group) AS (log_date, log_hour),
+           COUNT(logs)    AS total_count;
+STORE tot INTO '{total_dir}' USING PigStorage('\\t');
+""")
+    totals = {}
+    for line in _read_output(total_dir):
+        p = line.split("\t")
+        if len(p) == 3:
+            try:
+                totals[(p[0], int(p[1]))] = int(p[2])
+            except ValueError:
+                pass
 
-    # Create HDFS working directories
-    _hdfs_mkdir(HDFS_INPUT)
-    _hdfs_mkdir(HDFS_OUTPUT)
-
-    print(f"\n[Pig] Run ID: {run_id}")
-    print(f"[Pig] Processing files: {log_files}")
-    print(f"[Pig] Running in MapReduce mode on Hadoop\n")
-
-    for batch_id, batch, malformed in parse_files(log_files, batch_size):
-        total_batches   += 1
-        total_records   += len(batch)
-        total_malformed += malformed
-
-        print(f"  Batch {batch_id:>4} | records={len(batch):>7} | malformed={malformed}")
-
-        batch_dir = os.path.join(TMP_DIR, f"batch_{batch_id}")
-        os.makedirs(batch_dir, exist_ok=True)
-
-        # Write CSV locally
-        csv_path = os.path.join(batch_dir, "input.csv")
-        _write_csv(batch, csv_path)
-
-        # Upload to HDFS
-        hdfs_csv = f"{HDFS_INPUT}/batch_{batch_id}.csv"
-        _hdfs_rm(hdfs_csv)
-        if not _hdfs_put(csv_path, hdfs_csv):
-            print(f"  [ERROR] Failed to upload batch {batch_id} to HDFS, skipping.")
-            continue
-
-        # ── Q1 ────────────────────────────────────────────────────────────────
-        hdfs_q1_out  = f"{HDFS_OUTPUT}/batch_{batch_id}_q1"
-        local_q1_out = os.path.join(batch_dir, "q1_merged.csv")
-        q1_script    = os.path.join(batch_dir, "q1.pig")
-        _hdfs_rm(hdfs_q1_out)
-        if _run_pig(_pig_q1(hdfs_csv, hdfs_q1_out), q1_script, hdfs_q1_out):
-            if _hdfs_getmerge(hdfs_q1_out, local_q1_out):
-                rows = _read_output(local_q1_out)
-                save_q1(pg_config, run_id, PIPELINE_NAME, batch_id,
-                        [(r[0], int(r[1]), int(r[2]), int(r[3]))
-                         for r in rows if len(r) == 4 and all(x.strip() for x in r)])
-                print(f"    Q1 saved: {len(rows)} rows")
-
-        # ── Q2 ────────────────────────────────────────────────────────────────
-        hdfs_q2_out  = f"{HDFS_OUTPUT}/batch_{batch_id}_q2"
-        local_q2_out = os.path.join(batch_dir, "q2_merged.csv")
-        q2_script    = os.path.join(batch_dir, "q2.pig")
-        _hdfs_rm(hdfs_q2_out)
-        if _run_pig(_pig_q2(hdfs_csv, hdfs_q2_out), q2_script, hdfs_q2_out):
-            if _hdfs_getmerge(hdfs_q2_out, local_q2_out):
-                rows = _read_output(local_q2_out)
-                valid = [(r[0], int(r[1]), int(r[2]), int(r[3]))
-                         for r in rows if len(r) == 4 and all(x.strip() for x in r)]
-                # Sort by request_count desc and take top 20
-                valid = sorted(valid, key=lambda x: x[1], reverse=True)[:20]
-                save_q2(pg_config, run_id, PIPELINE_NAME, batch_id, valid)
-                print(f"    Q2 saved: {len(valid)} rows")
-
-        # ── Q3 ────────────────────────────────────────────────────────────────
-        hdfs_q3_out  = f"{HDFS_OUTPUT}/batch_{batch_id}_q3"
-        local_q3_out = os.path.join(batch_dir, "q3_merged.csv")
-        q3_script    = os.path.join(batch_dir, "q3.pig")
-        _hdfs_rm(hdfs_q3_out)
-        if _run_pig(_pig_q3(hdfs_csv, hdfs_q3_out), q3_script, hdfs_q3_out):
-            if _hdfs_getmerge(hdfs_q3_out, local_q3_out):
-                rows = _read_output(local_q3_out)
-                save_q3(pg_config, run_id, PIPELINE_NAME, batch_id,
-                        [(r[0], int(r[1]), int(r[2]), int(r[3]), float(r[4]), int(r[5]))
-                         for r in rows if len(r) == 6 and all(x.strip() for x in r)])
-                print(f"    Q3 saved: {len(rows)} rows")
-
-        # Clean up HDFS and local batch files
-        _hdfs_rm(hdfs_csv)
-        _hdfs_rm(hdfs_q1_out)
-        _hdfs_rm(hdfs_q2_out)
-        _hdfs_rm(hdfs_q3_out)
-        shutil.rmtree(batch_dir)
-
-    finished_at = datetime.utcnow()
-    save_run_metadata(pg_config, run_id, PIPELINE_NAME,
-                      started_at, finished_at,
-                      total_records, total_batches,
-                      batch_size, total_malformed)
-
-    runtime = time.time() - start_time
-    print(f"\n[Pig] Done in {runtime:.2f}s | "
-          f"batches={total_batches} | records={total_records} | malformed={total_malformed}")
-
-    return run_id
+    # Pass 2: error requests per (date, hour)
+    error_dir = os.path.join(pig_tmp, "q3_error_out")
+    shutil.rmtree(error_dir, ignore_errors=True)
+    _exec_pig(pig_bin, pig_tmp, f"""
+logs = LOAD '{tsv}' USING PigStorage('\\t')
+       AS (host:chararray, status_code:int, resource_path:chararray,
+           log_date:chararray, log_hour:int, bytes_transferred:long);
+errs = FILTER logs BY status_code >= 400 AND status_code <= 599;
+grp  = GROUP errs BY (log_date, log_hour);
+res  = FOREACH grp {{
+           unique_hosts = DISTINCT errs.host;
+           GENERATE
+               FLATTEN(group)        AS (log_date, log_hour),
+               COUNT(errs)           AS error_count,
+               COUNT(unique_hosts)   AS distinct_error_hosts;
+       }}
+srt  = ORDER res BY log_date ASC, log_hour ASC;
+STORE srt INTO '{error_dir}' USING PigStorage('\\t');
+""")
+    rows = []
+    for line in _read_output(error_dir):
+        p = line.split("\t")
+        if len(p) == 4:
+            try:
+                log_date  = p[0]
+                log_hour  = int(p[1])
+                err_count = int(p[2])
+                distinct  = int(p[3])
+                total     = totals.get((log_date, log_hour), err_count)
+                err_rate  = round(err_count / total, 4) if total else 0.0
+                rows.append((log_date, log_hour, err_count, total, err_rate, distinct))
+            except ValueError:
+                pass
+    return rows
