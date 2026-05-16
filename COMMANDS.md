@@ -72,6 +72,7 @@ git --version
 | Java | 11 | Pig |
 | Pig | 0.17 | Pig only |
 | mrjob (pip) | 0.7 | MapReduce (no system install needed) |
+| Hive | 3.1 | Hive
 
 **Minimum installs by pipeline:**
 
@@ -80,7 +81,7 @@ git --version
 | MongoDB | Python, PostgreSQL, MongoDB | Java, Pig |
 | MapReduce | Python, PostgreSQL | MongoDB, Java, Pig |
 | Pig | Python, PostgreSQL, Java, Pig | MongoDB |
-| All 3 (no Hive) | Python, PostgreSQL, MongoDB, Java, Pig | Hive |
+| All 4  | Python, PostgreSQL, MongoDB, Java, Pig, Hive |
 
 ---
 
@@ -146,6 +147,16 @@ source ~/.bashrc
 sudo apt install -y git
 ```
 
+**Apache Hive 3.1** — required for Hive pipeline
+```bash
+wget https://downloads.apache.org/hive/hive-3.1.3/apache-hive-3.1.3-bin.tar.gz
+tar -xzf apache-hive-3.1.3-bin.tar.gz
+mv apache-hive-3.1.3-bin ~/hive
+
+echo 'export HIVE_HOME=$HOME/hive' >> ~/.bashrc
+echo 'export PATH=$HIVE_HOME/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
 ---
 
 ## 2. Clone the repo
@@ -304,6 +315,8 @@ python main.py --pipeline mapreduce
 # Pig (~7-8 min, requires Java + Pig installed)
 python main.py --pipeline pig
 
+# Hive (~15-20 min, requires HiveServer2 + Hadoop services)
+python main.py --pipeline hive
 
 ```
 
@@ -313,6 +326,71 @@ python main.py
 ```
 
 ---
+
+### Hive
+
+Start Hadoop + Hive services:
+
+```bash
+# Hadoop DFS
+start-dfs.sh
+
+# YARN
+start-yarn.sh
+
+# Start HiveServer2
+hiveserver2
+```
+
+Open another terminal:
+
+```bash
+cd NoSQL_Project_Phase1_v2
+source venv/bin/activate
+```
+
+Verify Hive is working:
+
+```bash
+hive
+```
+
+Inside Hive:
+
+```sql
+CREATE DATABASE nasa_logs;
+SHOW DATABASES;
+```
+
+Run Hive pipeline:
+
+```bash
+python main.py --pipeline hive
+```
+
+Interactive menu:
+
+```bash
+python main.py
+```
+
+Then select:
+
+```text
+4. Hive (HiveServer2)
+```
+
+Verify Hadoop jobs:
+
+```bash
+yarn application -list
+```
+
+Verify HiveServer2 running:
+
+```bash
+netstat -tulnp | grep 10000
+```
 
 ## 10. View reports
 
@@ -324,6 +402,7 @@ python main.py --report
 python main.py --report --pipeline mongo
 python main.py --report --pipeline mapreduce
 python main.py --report --pipeline pig
+python main.py --report --pipeline hive
 
 # Specific run by ID (run_id is printed when each pipeline finishes)
 python main.py --report --run-id <run_id>
@@ -469,10 +548,16 @@ source venv/bin/activate
 sudo service postgresql start
 sudo service mongod start
 
+# Start Hadoop + Hive
+start-dfs.sh
+start-yarn.sh
+hiveserver2
+
 # Run pipelines
 python main.py --pipeline mongo
 python main.py --pipeline mapreduce
 python main.py --pipeline pig
+python main.py --pipeline hive
 
 # View report
 python main.py --report
@@ -532,6 +617,27 @@ pip install -r requirements.txt
 **`permission denied` on PostgreSQL**
 ```bash
 sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+```
+**`Could not connect to localhost:10000`**
+```bash
+hiveserver2
+netstat -tulnp | grep 10000
+```
+
+**`Database does not exist: nasa_logs`**
+```bash
+hive
+
+CREATE DATABASE nasa_logs;
+SHOW DATABASES;
+```
+
+**`Hive metastore/schema errors`**
+```bash
+rm -rf ~/metastore_db
+rm -f ~/derby.log
+
+$HIVE_HOME/bin/schematool -dbType derby -initSchema
 ```
 
 
