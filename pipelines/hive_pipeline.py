@@ -102,7 +102,13 @@ def run(
         # ── Upload TSV to HDFS ──────────────────────────────────────────────
         abs_tsv_path = os.path.abspath(tsv_path)
 
-        hdfs_dir  = f"/user/praneeth/hive_input/{batch['batch_id']}"
+        hdfs_user = (
+            os.environ.get("HDFS_USER")
+            or os.environ.get("USER")
+            or os.environ.get("LOGNAME")
+            or "hive"
+        )
+        hdfs_dir  = f"/user/{hdfs_user}/hive_input/{batch['batch_id']}"
         hdfs_file = f"{hdfs_dir}/batch.tsv"
 
         os.system(f"hdfs dfs -mkdir -p {hdfs_dir}")

@@ -345,7 +345,7 @@ hiveserver2
 Open another terminal:
 
 ```bash
-cd NoSQL_Project_Phase1_v2
+cd NoSQL_Project_Phase1
 source venv/bin/activate
 ```
 

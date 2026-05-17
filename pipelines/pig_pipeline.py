@@ -156,16 +156,16 @@ logs = LOAD '{tsv}' USING PigStorage('\\t')
            log_date:chararray, log_hour:int, bytes_transferred:long);
 grp  = GROUP logs BY resource_path;
 res  = FOREACH grp {{
-           unique_hosts = DISTINCT logs.host;
+           hosts = FOREACH logs GENERATE host;
+           unique_hosts = DISTINCT hosts;
            GENERATE
                group                       AS resource_path,
                COUNT(logs)                 AS request_count,
                SUM(logs.bytes_transferred) AS total_bytes,
                COUNT(unique_hosts)         AS distinct_host_count;
-       }}
-srt  = ORDER res BY request_count DESC;
-top  = LIMIT srt {Q2_TOP_N};
-STORE top INTO '{out_dir}' USING PigStorage('\\t');
+       }};
+
+STORE res INTO '{out_dir}' USING PigStorage('\\t');
 """)
     rows = []
     for line in _read_output(out_dir):
@@ -175,7 +175,8 @@ STORE top INTO '{out_dir}' USING PigStorage('\\t');
                 rows.append((p[0], int(p[1]), int(p[2]), int(p[3])))
             except ValueError:
                 pass
-    return rows
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:Q2_TOP_N]
 
 
 # ── Q3 ────────────────────────────────────────────────────────────────────────

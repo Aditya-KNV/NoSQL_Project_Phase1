@@ -1,7 +1,7 @@
 pymongo>=4.0
 psycopg2-binary>=2.9
 mrjob>=0.7
-pyhive[hive]>=0.6
+pyhive>=0.6
 thrift>=0.16
 thrift-sasl>=0.4
 python-dateutil>=2.8

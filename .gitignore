@@ -5,3 +5,7 @@ __pycache__/
 data/
 mr_tmp/
 *.Zone.Identifier
+pig_tmp/
+metastore_db/
+derby.log
+hive_tmp/
