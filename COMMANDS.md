@@ -329,6 +329,111 @@ python main.py
 
 ### Hive
 
+#### One-time Hadoop/Hive config (skip if already working)
+
+Use this only if Hive jobs fail or this is a fresh Hadoop install.
+Replace `/home/<user>/hadoop` with your actual Hadoop install path.
+
+```bash
+# Set Hadoop env for this shell
+export HADOOP_HOME=/home/<user>/hadoop
+export HADOOP_MAPRED_HOME=/home/<user>/hadoop
+export HADOOP_CONF_DIR=$HADOOP_HOME/etc/hadoop
+```
+
+**core-site.xml** (`$HADOOP_HOME/etc/hadoop/core-site.xml`)
+```xml
+<configuration>
+    <property>
+        <name>fs.defaultFS</name>
+        <value>hdfs://localhost:9000</value>
+    </property>
+</configuration>
+```
+
+**hdfs-site.xml** (`$HADOOP_HOME/etc/hadoop/hdfs-site.xml`)
+```xml
+<configuration>
+    <property>
+        <name>dfs.namenode.name.dir</name>
+        <value>file:///home/<user>/hadoop/dfs/name</value>
+    </property>
+    <property>
+        <name>dfs.datanode.data.dir</name>
+        <value>file:///home/<user>/hadoop/dfs/data</value>
+    </property>
+    <property>
+        <name>dfs.replication</name>
+        <value>1</value>
+    </property>
+</configuration>
+```
+
+**mapred-site.xml** (`$HADOOP_HOME/etc/hadoop/mapred-site.xml`)
+```xml
+<configuration>
+    <property>
+        <name>mapreduce.framework.name</name>
+        <value>yarn</value>
+    </property>
+    <property>
+        <name>yarn.app.mapreduce.am.env</name>
+        <value>HADOOP_MAPRED_HOME=/home/<user>/hadoop</value>
+    </property>
+    <property>
+        <name>mapreduce.map.env</name>
+        <value>HADOOP_MAPRED_HOME=/home/<user>/hadoop</value>
+    </property>
+    <property>
+        <name>mapreduce.reduce.env</name>
+        <value>HADOOP_MAPRED_HOME=/home/<user>/hadoop</value>
+    </property>
+</configuration>
+```
+
+**yarn-site.xml** (`$HADOOP_HOME/etc/hadoop/yarn-site.xml`)
+```xml
+<configuration>
+    <property>
+        <name>yarn.nodemanager.aux-services</name>
+        <value>mapreduce_shuffle</value>
+    </property>
+    <property>
+        <name>yarn.nodemanager.aux-services.mapreduce_shuffle.class</name>
+        <value>org.apache.hadoop.mapred.ShuffleHandler</value>
+    </property>
+</configuration>
+```
+
+**hive-site.xml** (`$HIVE_HOME/conf/hive-site.xml`)
+```xml
+<configuration>
+    <property>
+        <name>hive.server2.thrift.bind.host</name>
+        <value>127.0.0.1</value>
+    </property>
+    <property>
+        <name>hive.server2.thrift.port</name>
+        <value>10000</value>
+    </property>
+    <property>
+        <name>hive.metastore.warehouse.dir</name>
+        <value>/user/hive/warehouse</value>
+    </property>
+    <property>
+        <name>javax.jdo.option.ConnectionURL</name>
+        <value>jdbc:derby:;databaseName=/home/<user>/metastore_db;create=true</value>
+    </property>
+    <property>
+        <name>hive.server2.enable.doAs</name>
+        <value>false</value>
+    </property>
+</configuration>
+```
+
+
+
+
 Start Hadoop + Hive services:
 
 ```bash
